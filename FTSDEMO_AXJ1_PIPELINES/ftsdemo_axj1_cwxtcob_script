@@ -1,0 +1,351 @@
+#!/usr/bin/env groovy
+import hudson.model.*
+import hudson.EnvVars
+import groovy.json.JsonSlurperClassic
+import groovy.json.JsonBuilder
+import groovy.json.JsonOutput
+import java.net.URL
+
+// INFORMATION
+//this pipeline does not use webhooks to trigger it as it runs on a local Jenkins server
+// rather than the FTSDEMO Jenkins server, and network restrictions prevents the webhooks
+// on CWCC/HCI talking out to the local Jenkins_Id
+//
+// This pipeline requires the following parameters to be defined in the parent pipeline which
+// then retrieves this pipeline script from GitHub
+//  ISPW_Stream
+//  ISPW_Application
+//  ISPW_Src_Level
+//  ISPW_Release_Id
+
+// This pipeline requires GitHub repositories set up for each ISPW stream and Application 
+// combination to be used. Name format for repositories is 
+//   <Input stream>_<input application>_Unit_Tests  for example FTSDEMO_AXJ1_Unit_Tests
+
+// The unit tests required for this pipeline must ahere to the following naming conventionms...
+//  The Unit test project name  ISPW_stream_ISPW_Application_extratext  for example FTSDEMO_AXJ1_CWXTCOB
+//  the extra text is to delimit the project from other TTT projects for the same stream and application
+//
+//  Use the default scenario names
+//      
+
+// VARIABLES & Parameters
+// Jenkins credential ID and CES Personal Access token to be used for mainframe access
+String Jenkins_Id         = "653ec96f-9af8-4555-9d78-e1506f3549fb"  // jenkins token for HUK0320 tso user used to
+                                                                    // connect to the HCI
+String Host_Id            = "79fc0536-deb0-4426-a86d-d53d5959ee4f"  // mainframe URL token gend from syntax generator as used by the ISPW SCM and Total Test Plugins
+                                                                    // - derived from Host connection def in
+                                                                    // "Manage Jenkins" -> "Configure System" -> "Compuware Configurations"
+String Jenkins_CES_Id     = "HUK0320CES"                            // jenkins token for CES user string
+
+
+
+// ISPW Levels and container to be used by the promote/deploy/generate/regress operations
+// String ISPW_Stream        = "FTSDEMO"                //This is provided by main pipeline parameter
+// String ISPW_Application   = "AXJ1"                   //This is provided by main pipeline parameter
+// String ISPW_Dev_Level     = "DEV1"                   //this now derived from main pipeline parameter
+// String ISPW_Source_Lib    = "HUK0320.DEMO.COB.SRC2"  //these from older version of pipeline
+// String ISPW_Copy_Lib      = "HUK0320.DEMO.COB.CPY"   //
+
+//String ISPW_Container     = "${ISPW_Assignment}"  //ContainerID set to input assignment no.
+String ISPW_ContainerType = "assignments"         //Valid values are assignments or releases
+String ISPW_RuntimeConfig = "ISPW"
+
+// check the input current source Level 
+
+try {
+assert ["DEV1", "DEV2", "DEV3"].containsAll ([ISPW_Src_Level])
+}
+catch (AssertionError e) {
+    println "wrong level - valid source levels are DEV1, DEV2, DEV3" 
+    println SrcList
+    return}
+
+
+String ISPW_Source_Lib    = "SALESSUP.AXJ1." + ISPW_Src_Level + ".COB"
+String ISPW_Copy_Lib      = "SALESSUP.AXJ1." + ISPW_Src_Level + ".COPY"
+String ISPW_Job_Lib       = "SALESSUP.AXJ1." + ISPW_Src_Level + ".JOB"
+String ISPW_Code_Folder   = ""
+
+// SonarQube parameters
+String SQ_Project         = "ISPW_PIPELINE_AJ"          // Name of SQ Project, if not present at first it will be created
+                                                        // SonarQube ID used for both project key and project name
+String SQ_Scanner_Name    = "SonarQubeScanner"          // Name of SQ Scanner installation in "Manage Jenkins" -> "Global Tool Configuration" -> "SonarQube Scanner Installations"
+                                                        // On the FTS server this will be "scanner"
+String SQ_Server_Name     = "SonarServer"               // Name of SQ Server in "Manage Jenkins" -> "Configure System" -> "Sonar Qube servers"
+                                                        // On the FTS server this will be "localhost"
+String MF_Source          = "MF_Source"                 // The ISPW Plugin will download sources to this folder
+
+// Total Test JCL and Scenario/Testsuite used in CI process
+String TTT_TestPackage    = "CWXTCOB_Scenario.testscenario"
+String TTT_TestXml        = "*.xml"
+String TTT_Project        = "FTSDEMO_AXJ1_CWXTCOB"
+
+//  Code Coverage parameters
+String CC_Repository      = "HUK0320.DEMO.COCO"
+String CC_System          = "AXJ1"
+String CC_Testid          = "ISPWDEMO"
+def CC_DDIO_Override     = "SALESSUP.${ISPW_Application}.${ISPW_Src_Level}.SSD"
+
+//Git parameters
+// String Git_Hub_URL        = "https://github.com/alanjohnscpwr/ISPW_DEMO_REP.git" //Original repo
+
+String Jenkins_GitHub_Id  = "githubid"                              // git hub credentials stored in Jenkins
+String Git_User           = "alanjohnscpwr"                         // GitHub UserID - Register at GitHub as User
+String Git_Repo           = "${ISPW_Stream}_${ISPW_Application}_Unit_Tests.git"  // Access Git repository for input Stream & Repository
+String Git_Hub_URL        = "https://github.com/${Git_User}/${Git_Repo}"
+String Git_Branch         = "master"
+
+// XL Release parameters
+String XLR_Template         = "A Release from Jenkins - HUK0320 v2"  // XL Release template to invoke at the end of the Jenkins workflow                                          
+String XLR_User             = "XLRELID"                 // XL Release user ID. Configured in "Jenkins" -> "Manage Jenkins" -> "Configure System" -> "XL Release credentials"
+
+
+
+println "Parms received"
+println "ISPW_Application ${ISPW_Application}"
+println "ISPW_Src_Level ${ISPW_Src_Level}"
+println "ISPW_Release ${ISPW_Release_Id}"
+
+stage('run file reset')
+{
+    node{
+        bat 'start cmd.exe /c C:\\Users\\cpwr01\\Desktop\\FTSDEMO_AXJ1_ISPW_DEMO_reset.bat'
+    }
+}
+
+// Download TTT unit tests available in repo for the Input Stream and Application
+stage('TTT project checkout from Github')
+{
+    node{
+         checkout changelog: false,
+         poll: false,
+         scm: [$class: 'GitSCM',
+                branches: [[name: "*/${Git_Branch}"]],
+                doGenerateSubmoduleConfigurations: false,
+                extensions: [],
+                submoduleCfg: [],
+                userRemoteConfigs: [[credentialsId: "${Jenkins_GitHub_Id}",
+                                    name: 'origin',
+                                    url: "${Git_Hub_URL}"]]]
+        }
+}
+
+stage('ISPW Checkout of my CWXT* source')
+{
+    node{
+        checkout changelog: false,
+        poll: false,
+        scm: [$class: 'IspwConfiguration',
+        componentType: 'COB, COPY',
+        connectionId: "${Host_Id}",
+        credentialsId: "${Jenkins_Id}",
+        folderName: '',
+        levelOption: '0',
+        serverApplication: "${ISPW_Application}",
+        serverConfig: "${ISPW_RuntimeConfig}",
+        serverLevel: "${ISPW_Src_Level}",
+        serverStream: "${ISPW_Stream}"]
+    }
+}
+
+def ISPW_Assignment_Parm        = 'assignmentId=' + ISPW_Assignment
+def ISPW_Level_Parm             = '\nlevel=' + ISPW_Src_level
+def ISPW_Runtime_Config_Parm    = '\nruntimeConfiguration=' + ISPW_RuntimeConfig
+def ISPW_Remain_Params          = '\nevents.name=Completed\nevents.body=Promoted\nevents.httpHeaders=Jenkins-Crumb:no-crumb\nevents.credentials=admin:library'
+
+ISPW_Params = ISPW_Assignment_Parm + ISPW_Level_Parm + ISPW_Runtime_Config_Parm + ISPW_Remain_Params
+
+stage('ISPW Generate')
+{
+    node{
+       ispwOperation connectionId: "${Host_Id}",
+       credentialsId: "${Jenkins_CES_Id}",
+       ispwAction: 'GenerateTasksInAssignment',
+       ispwRequestBody:  "${ISPW_Params}"
+    }
+}
+
+// set number for the path for the Runner jcl
+pathNum = ISPW_Src_Level[-1..-1]
+
+
+// Use the Path Number to determine the right Runner JCL to use (different STEPLIB concatenations)
+ 
+def TTT_Jcl = "Runner" + pathNum + ".jcl"
+def ISPW_Target_Level = "QA" + pathNum
+def ISPW_Stage_Level = "STG"
+
+
+println pathNum
+
+node
+{
+// findFiles requires the "Pipeline Utilities Plugin"
+// Get all testscenario files in the current workspace into an array of type File
+    def TTTListOfScenarios = findFiles(glob: '**/*.testscenario')
+
+// Get all Sources in the MF_Source folder into an Array
+    def ListOfSources  = findFiles(glob: "**/${ISPW_Application}/${MF_Source}/*.cbl")
+
+    def ListOfPrograms = []
+
+    ListOfSources.each
+    {
+        ListOfPrograms.add(it.name.trim().split("\\.")[0])
+    }
+    
+    
+     stage('Run checked out unit tests')
+    {   
+        // Search all downloaded testscenarios and loop through them
+        println "*************************"
+        println "Loop through TTT projects"
+        println "*************************"
+
+        // Loop through all downloaded TTT scenarios
+        TTTListOfScenarios.each
+        {
+            def TTTScenarioPath = it.path
+            // Get root node of the path, i.e. the name of the TTT project
+            // The split method uses regex to search for patterns, therefore
+            // Backslahes, Dots and Underscores which mean certain patterns in regex need to be escaped
+            // The backslash in Windows paths is duplicated in Java, therefore it need to be escaped twice
+            def TTTProjectName         = it.path.trim().split("\\\\")[0]   // TTT Project name is the root folder of the full path to the testscenario
+            def TTTScenarioFullName    = it.name                           // Get the full name of the testscenario file i.e. "name.testscenario"
+            def TTTScenarioName        = it.name.trim().split("\\.")[0]    // Get the name of the scenario file without ".testscenario"
+            def TTTScenarioTarget      = TTTScenarioName.split("\\_")[0]   // Target Program will be the first part of the scenario name (convention)
+            
+            // For each of the scenarios walk through the list of new scources and determine if the target matches one of the programs
+            // In that case, execute the unit test
+
+            //Determine if the program name matches the target of the TTT scenario
+            if(ListOfPrograms.contains(TTTScenarioTarget))
+            {
+                println "*************************"
+                println "Scenario " + TTTScenarioFullName
+                println "Path " + TTTScenarioPath
+                println "Project " + TTTProjectName
+                println "*************************"
+
+                   step([$class: 'TotalTestBuilder',
+                    ccClearStats: false,
+                    ccRepo: "${CC_Repository}",
+                    ccSystem: "${ISPW_Application}",
+                    ccTestId: "${BUILD_DISPLAY_NAME}",  //Jenkins environemnt variable, resolves to build number, i.e. #177
+                    credentialsId: "${Jenkins_Id}",
+                    deleteTemp: true,
+                    hlq: '',
+                    connectionId: "${Host_Id}",
+                    jcl: "${TTT_Jcl}",
+                    projectFolder: "${TTTProjectName}",
+                    testSuite: "${TTTScenarioFullName}",
+                    useStubs: true])
+    // Process the Total Test result files into Jenkins
+                junit allowEmptyResults: true, keepLongStdio: true, testResults: 'TTTUnit/*.xml'
+            }
+        }
+    }
+    // Download CoCo Results from Test Runs
+    println "****************"
+    println "Gather CoCo Data"
+    println "****************"
+
+    stage("Gather Code Coverage Data")
+    {
+        string sources="${ISPW_Application}\\${MF_Source}"
+        def ccproperties   = 'cc.sources=' + sources + '\rcc.repos=' + CC_Repository + '\rcc.system=' + ISPW_Application + "*" + '\rcc.test=' + BUILD_DISPLAY_NAME + '\rcc.ddio.overrides=' + CC_DDIO_Override
+
+        step([$class: 'CodeCoverageBuilder',
+            analysisProperties: ccproperties,
+                analysisPropertiesPath: '',
+                connectionId: "${Host_Id}",
+                credentialsId: "${Jenkins_Id}"])
+    }
+    
+    
+     // Analyse Sources, Test Results and Coverage in SonarQube
+    println "******************"
+    println "SonarQube analysis"
+    println "******************"
+
+    stage("SonarQube analysis")
+    {
+        // Requires SonarQube Scanner 2.8+
+        def scannerHome = tool "${SQ_Scanner_Name}";
+
+        TTTListOfScenarios.each
+        {
+            def TTTScenarioPath = it.path
+            def TTTProjectName = it.path.trim().split("\\\\")[0]
+            def TTTScenarioName = it.name.trim().split("\\.")[0]
+
+            withSonarQubeEnv("${SQ_Server_Name}")
+            {
+                // Run SonarQube Scanner
+                def SQ_Tests                = " -Dsonar.tests=./${TTTProjectName} -Dsonar.testExecutionReportPaths=TTTSonar/${TTTScenarioName}.xml -Dsonar.coverageReportPaths=Coverage/CodeCoverage.xml"
+                def SQ_ProjectKey           = " -Dsonar.projectKey=${SQ_Project} -Dsonar.projectName=${SQ_Project} -Dsonar.projectVersion=1.0"
+                def SQ_Source               = " -Dsonar.sources=${ISPW_Application}\\${MF_Source}"
+                def SQ_Copybook             = " -Dsonar.cobol.copy.directories=${ISPW_Application}\\${MF_Source}"
+                def SQ_Cobol_conf           = " -Dsonar.cobol.file.suffixes=cbl,testsuite,testscenario,stub -Dsonar.cobol.copy.suffixes=cpy -Dsonar.sourceEncoding=UTF-8"
+                bat "${scannerHome}/bin/sonar-scanner" + SQ_Tests + SQ_ProjectKey + SQ_Source + SQ_Copybook + SQ_Cobol_conf
+            }
+        }
+    }
+    
+     stage("Check Quality Gate")
+    {
+        string qg_status = "passed"
+          if (Gate_Passed == 'N')
+           {
+            echo "assume Quality Gate status is: Failed"
+            qg_status = "failed"
+            error "Exiting Pipeline"
+           }
+     }
+  
+  
+  stage('ISPW Promote to QA1 level')
+    {
+    node{
+       ispwOperation connectionId: "${Host_Id}",
+       credentialsId: "${Jenkins_CES_Id}",
+       ispwAction: 'PromoteAssignment',
+       ispwRequestBody:  "${ISPW_Params}"
+        }
+    }    
+    
+    // Trigger XL Release Jenkins Plugin to kickoff a Release
+    println "**********************************************************"
+    println "Quality Gate status ok"
+    println "Will Start XL Release"
+    println "**********************************************************"
+
+
+
+
+    //stage("XL Release stage - promote thru STG to PROD")
+    //{
+    //    xlrCreateRelease releaseTitle: 'Release for $BUILD_TAG', 
+    //    serverCredentials: 'XLRELID', 
+    //    startRelease: true, 
+    //    template: 'A Release from Jenkins - HUK0320 v2', 
+    //    variables: [[propertyName: 'ISPW_Dev_level', propertyValue: 'QA1'], 
+    //                [propertyName: 'ISPW_STG_Level', propertyValue: 'STG'], 
+    //                [propertyName: 'ISPW_RELEASE_ID', propertyValue: "${ISPW_Release_Id}"]]
+    //}
+
+
+
+   stage("Start XL Release")
+    {
+        xlrCreateRelease releaseTitle: 'Release for $BUILD_TAG',
+        serverCredentials: "${XLR_User}",
+        startRelease: true,
+        template: "${XLR_Template}",
+        variables: [[propertyName: 'ISPW_Dev_level', propertyValue: "${ISPW_Target_Level}"],
+                    [propertyName: 'ISPW_Stg_Level', propertyValue: "${ISPW_Stage_Level}"],
+                    [propertyName: 'ISPW_RELEASE_ID', propertyValue: "${ISPW_Release_Id}"]]
+    }
+}
+
